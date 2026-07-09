@@ -797,16 +797,25 @@ class BandWindow(QWidget):
     # ------------------------------------------------------------ hotkeys
 
     def register_hotkeys(self, actions):
-        """actions: dict name -> callable, matching keys in config['hotkeys']."""
+        """actions: dict name -> callable, matching keys in config['hotkeys'].
+        Returns a list of action names that failed to register (e.g. combo
+        already taken by another app or another running copy of this app) --
+        those are skipped rather than raising, so one conflicting hotkey
+        doesn't take down the whole app on startup."""
         self._hotkey_actions = actions
         hwnd = int(self.winId())
         self._hotkey_manager = HotkeyManager(hwnd)
         hk_config = self.config.get("hotkeys", default={})
+        failed = []
         for name, callback in actions.items():
             spec = hk_config.get(name)
             if not spec:
                 continue
-            self._hotkey_manager.register(name, spec, callback)
+            try:
+                self._hotkey_manager.register(name, spec, callback)
+            except OSError:
+                failed.append(name)
+        return failed
 
     def reregister_hotkeys(self):
         """Unregisters and re-registers all hotkeys from the current config

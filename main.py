@@ -158,7 +158,7 @@ def main():
         dialog.activateWindow()
         force_foreground(dialog)
 
-    window.register_hotkeys({
+    startup_failed_hotkeys = window.register_hotkeys({
         "toggle_play_pause": window.toggle_play_pause,
         "next_short": window.next_short,
         "toggle_window": window.toggle_window,
@@ -166,6 +166,13 @@ def main():
         "toggle_info_panels": window.toggle_info_panels,
         "open_interact_window": open_interact_window,
     })
+    if startup_failed_hotkeys:
+        QMessageBox.warning(
+            None, "OnGameShorts",
+            "以下のホットキーは他のアプリ(または既に起動中の本アプリ)と重複しており、"
+            "登録できませんでした。設定画面から変更できます:\n"
+            + "\n".join(startup_failed_hotkeys),
+        )
 
     # --- system tray icon: only way to quit, since the band window has
     # no titlebar/close button by design ------------------------------
