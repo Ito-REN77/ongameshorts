@@ -162,36 +162,46 @@ _VOLUME_AUTOPLAY_JS_TEMPLATE = r"""
     if (el) window.__ogsApplyVolume(el);
   };
 
-  window.__ogsSetAutoplay = function (b) {
-    window.__ogsAutoplay = b;
-  };
-
   function goNext() {
     document.dispatchEvent(new KeyboardEvent('keydown', {
       key: 'ArrowDown', code: 'ArrowDown', keyCode: 40, which: 40, bubbles: true
     }));
   }
 
+  window.__ogsSetAutoplay = function (b) {
+    window.__ogsAutoplay = b;
+    var el = document.querySelector('ytd-reel-video-renderer[is-active] video')
+         || document.querySelector('video');
+    if (el) el.loop = !b;
+  };
+
+  // Shorts set the native loop attribute so the browser replays the video
+  // on its own once it ends -- and per spec, looping a video that way
+  // never fires 'ended' at all, which is why watching for 'ended' alone
+  // didn't work. Turning loop off (only while autoplay-to-next is on)
+  // restores real 'ended' events instead of us having to guess a loop
+  // restart from currentTime jitter, which false-positived on ordinary
+  // buffering stalls and skipped to the next short mid-video.
+  function applyState(v) {
+    window.__ogsApplyVolume(v);
+    v.loop = !window.__ogsAutoplay;
+  }
+
   function bind() {
     var v = document.querySelector('video');
-    if (!v || v.__ogsVolBound) return;
+    if (!v) return;
+    // Shorts reuse a single <video> element across shorts (swapping its
+    // source) rather than creating a new one each time, so loop/volume
+    // must be reapplied on every source change, not just once -- YouTube
+    // resets loop back to true itself whenever a new short loads.
+    // 'durationchange' reliably fires on each source swap (each short has
+    // a different duration) as well as for the first video.
+    applyState(v);
+    if (v.__ogsVolBound) return;
     v.__ogsVolBound = true;
-    window.__ogsApplyVolume(v);
-    // Shorts loop the current video in place (via the loop attribute or
-    // YouTube's own JS seeking back to 0) instead of firing a real
-    // 'ended' event, so that alone never fires here. Watching for
-    // currentTime snapping from near-the-end back to near-zero catches a
-    // loop restart either way, and doubles as the 'ended' fallback for
-    // the rare case a video isn't looped.
+    v.addEventListener('durationchange', function () { applyState(v); });
     v.addEventListener('ended', function () {
       if (window.__ogsAutoplay) goNext();
-    });
-    v.addEventListener('timeupdate', function () {
-      var prev = v.__ogsPrevTime;
-      if (prev !== undefined && prev > 1 && v.currentTime < 0.5 && window.__ogsAutoplay) {
-        goNext();
-      }
-      v.__ogsPrevTime = v.currentTime;
     });
   }
   bind();
@@ -213,15 +223,67 @@ _VOLUME_AUTOPLAY_JS_TEMPLATE = r"""
 _AUTO_RESUME_JS = r"""
 (function () {
   if (window.__ogsWantPlaying === undefined) window.__ogsWantPlaying = true;
+  var MAX_RESUME_DELAY_MS = 2000;
+  var STABLE_PLAYBACK_MS = 2000;
+
   function bind() {
     var v = document.querySelector('video');
     if (!v || v.__ogsBound) return;
     v.__ogsBound = true;
+    v.__ogsResumeAttempts = 0;
+
+    // Measured: some videos get paused by something outside our control
+    // (not buffering -- readyState stays HAVE_ENOUGH_DATA throughout) a
+    // few hundred ms after *any* play() call, repeatedly, regardless of
+    // window size or focus state -- root cause not fully pinned down, but
+    // resuming forever just re-triggers it every time, which is audible
+    // as continuous crackling. Retrying a bounded number of times with
+    // backoff recovers the common case (a couple of early hiccups) without
+    // fighting an unrecoverable case indefinitely.
     v.addEventListener('pause', function () {
-      if (window.__ogsWantPlaying) {
-        if (window.__ogsApplyVolume) window.__ogsApplyVolume(v);
-        v.play().catch(function () {});
-      }
+      // v.ended means this pause is the video reaching its natural end
+      // (only possible now that autoplay-to-next sets loop=false) -- that
+      // must be left alone for the 'ended' handler (_VOLUME_AUTOPLAY_JS)
+      // to react to, not resumed here, or the two fight: this would
+      // restart the finished video from 0 right as the other handler
+      // tries to advance to the next short.
+      if (!window.__ogsWantPlaying || v.ended) return;
+      if (v.__ogsResumeScheduled) return;
+      v.__ogsResumeScheduled = true;
+      // Retries forever (never gives up -- a video that never gets to
+      // keep playing is worse than one that occasionally blips), but
+      // backs off exponentially up to MAX_RESUME_DELAY_MS so a
+      // persistently-fighting video settles into a quiet ~2s cadence
+      // instead of crackling continuously.
+      var delay = Math.min(150 * Math.pow(2, v.__ogsResumeAttempts), MAX_RESUME_DELAY_MS);
+      setTimeout(function () {
+        v.__ogsResumeScheduled = false;
+        if (v.paused && !v.ended && window.__ogsWantPlaying) {
+          v.__ogsResumeAttempts++;
+          if (window.__ogsApplyVolume) window.__ogsApplyVolume(v);
+          v.play().catch(function () {});
+        }
+      }, delay);
+    });
+
+    // Once playback has actually held steady for a while, treat any prior
+    // struggle as over and give a fresh retry budget for next time. Each
+    // new 'playing' cancels the previous pending check, so as long as
+    // pause/playing keeps firing in a tight loop this check keeps getting
+    // pushed out and never actually resets the budget -- only a genuine
+    // >=2s hold (no further 'playing' events) counts as recovered.
+    v.addEventListener('playing', function () {
+      if (v.__ogsStableCheckTimer) clearTimeout(v.__ogsStableCheckTimer);
+      v.__ogsStableCheckTimer = setTimeout(function () {
+        if (!v.paused) v.__ogsResumeAttempts = 0;
+      }, STABLE_PLAYBACK_MS);
+    });
+
+    // Shorts reuse a single <video> element across shorts, so a retry
+    // budget exhausted on one short must not carry over and permanently
+    // silence recovery for every short after it.
+    v.addEventListener('durationchange', function () {
+      v.__ogsResumeAttempts = 0;
     });
   }
   bind();
