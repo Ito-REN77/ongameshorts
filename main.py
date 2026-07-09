@@ -90,6 +90,11 @@ def main():
             # a successful login shows up immediately instead of waiting
             # for a manual "再読み込み".
             login.destroyed.connect(window.reload_current)
+            # WA_DeleteOnClose means the underlying C++ object is gone by
+            # the time this fires -- clear the stale reference too, or the
+            # next open_login() call dereferences a deleted QWidget
+            # (RuntimeError: wrapped C/C++ object ... has been deleted).
+            login.destroyed.connect(lambda: state.update(login_window=None))
             state["login_window"] = login
             login.show()
         login.raise_()
@@ -139,6 +144,12 @@ def main():
 
         dialog = SettingsDialog(config, start_section=start_section, on_login=open_login)
         dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        # See open_login()'s matching connect() for why this is needed:
+        # WA_DeleteOnClose deletes the C++ object on close, and without
+        # this the next open_settings() call (e.g. via the Ctrl+Alt+S
+        # hotkey) dereferences that dead object in the isVisible() check
+        # below (RuntimeError: wrapped C/C++ object ... has been deleted).
+        dialog.destroyed.connect(lambda: state.update(settings_dialog=None))
         state["settings_dialog"] = dialog
 
         def on_finished(result):
