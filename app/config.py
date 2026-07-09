@@ -8,6 +8,8 @@ DEFAULTS = {
     "compact_style": True,
     "hide_video_ui": True,
     "show_info_panels": True,
+    "volume": 80,
+    "autoplay": True,
     "window": {
         "width": 600,
         "height": 340,

@@ -12,12 +12,14 @@ from PyQt6.QtCore import Qt, QUrl, QTimer, QEvent
 from PyQt6.QtGui import QGuiApplication
 from PyQt6.QtWidgets import (
     QWidget, QLabel, QHBoxLayout, QVBoxLayout, QFrame, QSizePolicy, QPushButton,
+    QSlider,
 )
 from PyQt6.QtWebEngineCore import QWebEnginePage, QWebEngineScript
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 
 from .browser_profile import get_profile
 from .hotkeys import HotkeyManager
+from .widgets import ToggleSwitch
 
 
 # https://www.youtube.com/shorts (no video id) redirects a signed-in
@@ -137,6 +139,68 @@ _HIDE_VIDEO_UI_JS = r"""
 })();
 """
 
+# Volume and autoplay-to-next-short state, kept in the page (like
+# window.__ogsWantPlaying above) so it survives YouTube swapping in a new
+# <video> element for each short. window.__ogsApplyVolume is the single
+# place that touches volume/muted, so the play/resume/gesture handlers
+# below stay consistent with a volume slider set to 0 instead of fighting
+# it with their own "unmute on play" logic.
+_VOLUME_AUTOPLAY_JS_TEMPLATE = r"""
+(function () {
+  if (window.__ogsVolume === undefined) window.__ogsVolume = __OGS_INITIAL_VOLUME__;
+  if (window.__ogsAutoplay === undefined) window.__ogsAutoplay = __OGS_INITIAL_AUTOPLAY__;
+
+  window.__ogsApplyVolume = function (el) {
+    el.volume = window.__ogsVolume;
+    el.muted = window.__ogsVolume <= 0;
+  };
+
+  window.__ogsSetVolume = function (v) {
+    window.__ogsVolume = v;
+    var el = document.querySelector('ytd-reel-video-renderer[is-active] video')
+         || document.querySelector('video');
+    if (el) window.__ogsApplyVolume(el);
+  };
+
+  window.__ogsSetAutoplay = function (b) {
+    window.__ogsAutoplay = b;
+  };
+
+  function goNext() {
+    document.dispatchEvent(new KeyboardEvent('keydown', {
+      key: 'ArrowDown', code: 'ArrowDown', keyCode: 40, which: 40, bubbles: true
+    }));
+  }
+
+  function bind() {
+    var v = document.querySelector('video');
+    if (!v || v.__ogsVolBound) return;
+    v.__ogsVolBound = true;
+    window.__ogsApplyVolume(v);
+    // Shorts loop the current video in place (via the loop attribute or
+    // YouTube's own JS seeking back to 0) instead of firing a real
+    // 'ended' event, so that alone never fires here. Watching for
+    // currentTime snapping from near-the-end back to near-zero catches a
+    // loop restart either way, and doubles as the 'ended' fallback for
+    // the rare case a video isn't looped.
+    v.addEventListener('ended', function () {
+      if (window.__ogsAutoplay) goNext();
+    });
+    v.addEventListener('timeupdate', function () {
+      var prev = v.__ogsPrevTime;
+      if (prev !== undefined && prev > 1 && v.currentTime < 0.5 && window.__ogsAutoplay) {
+        goNext();
+      }
+      v.__ogsPrevTime = v.currentTime;
+    });
+  }
+  bind();
+  new MutationObserver(bind).observe(document.documentElement, {
+    childList: true, subtree: true
+  });
+})();
+"""
+
 # YouTube's mobile player intermittently pauses (and mutes) playback on
 # its own a couple seconds in, even with the hasFocus()/backgrounding
 # fixes above -- possibly an internal buffering/stall heuristic. Polling
@@ -155,7 +219,7 @@ _AUTO_RESUME_JS = r"""
     v.__ogsBound = true;
     v.addEventListener('pause', function () {
       if (window.__ogsWantPlaying) {
-        v.muted = false;
+        if (window.__ogsApplyVolume) window.__ogsApplyVolume(v);
         v.play().catch(function () {});
       }
     });
@@ -173,7 +237,7 @@ _PLAY_JS = r"""
   var v = document.querySelector('ytd-reel-video-renderer[is-active] video')
        || document.querySelector('video');
   if (!v) return;
-  v.muted = false;
+  if (window.__ogsApplyVolume) window.__ogsApplyVolume(v);
   v.play().catch(function () {});
 })();
 """
@@ -199,8 +263,10 @@ _TOGGLE_PLAY_PAUSE_JS = r"""
        || document.querySelector('video');
   if (!v) return;
   window.__ogsWantPlaying = !window.__ogsWantPlaying;
-  if (window.__ogsWantPlaying) { v.muted = false; v.play().catch(function () {}); }
-  else { v.pause(); }
+  if (window.__ogsWantPlaying) {
+    if (window.__ogsApplyVolume) window.__ogsApplyVolume(v);
+    v.play().catch(function () {});
+  } else { v.pause(); }
 })();
 """
 
@@ -262,8 +328,10 @@ _GESTURES_JS = r"""
          || document.querySelector('video');
     if (!v) return;
     window.__ogsWantPlaying = !window.__ogsWantPlaying;
-    if (window.__ogsWantPlaying) { v.muted = false; v.play().catch(function () {}); }
-    else { v.pause(); }
+    if (window.__ogsWantPlaying) {
+      if (window.__ogsApplyVolume) window.__ogsApplyVolume(v);
+      v.play().catch(function () {});
+    } else { v.pause(); }
   }
 
   document.addEventListener('mousedown', onDown, true);
@@ -383,6 +451,22 @@ class BandWindow(QWidget):
                 background-color: #c0392b;
                 color: white;
             }
+            QSlider::groove:horizontal {
+                height: 4px;
+                background: #33333d;
+                border-radius: 2px;
+            }
+            QSlider::sub-page:horizontal {
+                height: 4px;
+                background: #9fd2ff;
+                border-radius: 2px;
+            }
+            QSlider::handle:horizontal {
+                width: 12px;
+                margin: -5px 0;
+                background: #e8e8ec;
+                border-radius: 6px;
+            }
             """
         )
 
@@ -410,6 +494,31 @@ class BandWindow(QWidget):
         left.addWidget(heading)
         left.addWidget(self.title_label, 1)
         left.addStretch(1)
+
+        volume_row = QHBoxLayout()
+        volume_row.setSpacing(6)
+        volume_label = QLabel("音量")
+        volume_label.setProperty("class", "actionLabel")
+        self.volume_slider = QSlider(Qt.Orientation.Horizontal)
+        self.volume_slider.setRange(0, 100)
+        self.volume_slider.setValue(self.config.get("volume", default=80))
+        self.volume_slider.valueChanged.connect(self.set_volume)
+        volume_row.addWidget(volume_label, 0)
+        volume_row.addWidget(self.volume_slider, 1)
+        left.addLayout(volume_row)
+
+        autoplay_row = QHBoxLayout()
+        autoplay_row.setSpacing(6)
+        autoplay_label = QLabel("自動再生")
+        autoplay_label.setProperty("class", "actionLabel")
+        initial_autoplay = self.config.get("autoplay", default=True)
+        self.autoplay_toggle = ToggleSwitch()
+        self.autoplay_toggle.setChecked(initial_autoplay)
+        self.autoplay_toggle.toggled.connect(self.set_autoplay)
+        autoplay_row.addWidget(autoplay_label, 0)
+        autoplay_row.addStretch(1)
+        autoplay_row.addWidget(self.autoplay_toggle, 0)
+        left.addLayout(autoplay_row)
 
         left_widget = QWidget()
         left_widget.setLayout(left)
@@ -527,6 +636,21 @@ class BandWindow(QWidget):
         self._force_focus_script.setSourceCode(_FORCE_FOCUS_JS)
         self._page.scripts().insert(self._force_focus_script)
 
+        volume_pct = self.config.get("volume", default=80)
+        autoplay = self.config.get("autoplay", default=True)
+        self._volume_autoplay_script = QWebEngineScript()
+        self._volume_autoplay_script.setName("ongameshorts-volume-autoplay")
+        self._volume_autoplay_script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentReady)
+        self._volume_autoplay_script.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
+        self._volume_autoplay_script.setRunsOnSubFrames(False)
+        volume_autoplay_source = (
+            _VOLUME_AUTOPLAY_JS_TEMPLATE
+            .replace("__OGS_INITIAL_VOLUME__", str(max(0, min(100, volume_pct)) / 100))
+            .replace("__OGS_INITIAL_AUTOPLAY__", "true" if autoplay else "false")
+        )
+        self._volume_autoplay_script.setSourceCode(volume_autoplay_source)
+        self._page.scripts().insert(self._volume_autoplay_script)
+
         if self.config.get("compact_style", default=True):
             self._compact_style_script = QWebEngineScript()
             self._compact_style_script.setName("ongameshorts-compact-style")
@@ -591,6 +715,22 @@ class BandWindow(QWidget):
         # so this stays consistent with clicks/swipes handled by
         # _GESTURES_JS -- those update the same flag directly in the page.
         self._run_js(_TOGGLE_PLAY_PAUSE_JS)
+
+    def set_volume(self, value):
+        """value: 0-100. Applied live to the current video and persisted so
+        the next launch (and the next short YouTube swaps in) keeps it."""
+        value = max(0, min(100, int(value)))
+        self._run_js(f"window.__ogsSetVolume && window.__ogsSetVolume({value / 100});")
+        self.config.set("volume", value)
+        self.config.save()
+
+    def set_autoplay(self, enabled):
+        """When on, advancing to the next short happens automatically once
+        the current one finishes playing (in addition to the manual
+        next_short hotkey, which always works either way)."""
+        self._run_js(f"window.__ogsSetAutoplay && window.__ogsSetAutoplay({'true' if enabled else 'false'});")
+        self.config.set("autoplay", bool(enabled))
+        self.config.save()
 
     def toggle_visibility(self):
         self.hide() if self.isVisible() else self.show()
