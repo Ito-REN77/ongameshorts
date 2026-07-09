@@ -223,7 +223,7 @@ _VOLUME_AUTOPLAY_JS_TEMPLATE = r"""
 _AUTO_RESUME_JS = r"""
 (function () {
   if (window.__ogsWantPlaying === undefined) window.__ogsWantPlaying = true;
-  var MAX_RESUME_DELAY_MS = 2000;
+  var MAX_RESUME_DELAY_MS = 0;
   var STABLE_PLAYBACK_MS = 2000;
 
   function bind() {
@@ -251,11 +251,14 @@ _AUTO_RESUME_JS = r"""
       if (v.__ogsResumeScheduled) return;
       v.__ogsResumeScheduled = true;
       // Retries forever (never gives up -- a video that never gets to
-      // keep playing is worse than one that occasionally blips), but
-      // backs off exponentially up to MAX_RESUME_DELAY_MS so a
-      // persistently-fighting video settles into a quiet ~2s cadence
-      // instead of crackling continuously.
-      var delay = Math.min(150 * Math.pow(2, v.__ogsResumeAttempts), MAX_RESUME_DELAY_MS);
+      // keep playing is worse than one that occasionally blips).
+      // MAX_RESUME_DELAY_MS=0 means no backoff at all: every pause is
+      // retried on the very next tick. This trades away the original
+      // protection against continuous audible crackling on a
+      // persistently-fighting video (150ms/500ms/2000ms caps were all
+      // tried before this and judged too slow) -- if instant retry turns
+      // out to crackle audibly, raise MAX_RESUME_DELAY_MS back up.
+      var delay = Math.min(50 * Math.pow(2, v.__ogsResumeAttempts), MAX_RESUME_DELAY_MS);
       setTimeout(function () {
         v.__ogsResumeScheduled = false;
         if (v.paused && !v.ended && window.__ogsWantPlaying) {
